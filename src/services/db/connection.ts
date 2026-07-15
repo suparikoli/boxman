@@ -38,16 +38,36 @@ export function buildDynamicUpdate(
 }
 
 /**
- * Simple async mutex to prevent concurrent SQLite transactions.
- * SQLite only supports one writer at a time; overlapping BEGIN/COMMIT/ROLLBACK
- * on the same connection causes "cannot start a transaction within a transaction"
- * or "database is locked" errors.
+ * Serialises a group of write statements against every other `withTransaction`
+ * group, so two groups can never interleave their writes.
+ *
+ * IMPORTANT — why this deliberately does NOT issue `BEGIN`/`COMMIT`:
+ * tauri-plugin-sql runs every `execute()`/`select()` on a *pooled* sqlx
+ * connection (the sqlx default pool is up to 10 connections) and returns that
+ * connection to the pool after each call. The separate `BEGIN`, write and
+ * `COMMIT` statements of an interactive transaction can therefore land on
+ * *different* physical connections whenever another query interleaves. Under
+ * concurrency that:
+ *   1. breaks atomicity — each write auto-commits on whichever connection it
+ *      happens to acquire (observed: a thread row persisted without its
+ *      message); and
+ *   2. can strand a `BEGIN` on one pooled connection, holding the SQLite write
+ *      lock until every *other* write times out against sqlx's 5s busy-timeout
+ *      (observed: uniform ~5s "slow statement" warnings on trivial writes).
+ * The plugin exposes no real transaction API, so the only reliably-atomic unit
+ * is a single statement.
+ *
+ * This helper instead runs the callback's writes as a *serialised* sequence of
+ * individually-committed statements: correct and free of lock contention, at
+ * the cost of all-or-nothing rollback. Its only callers (IMAP sync, snooze)
+ * issue idempotent, re-derivable writes, so a partially-applied group is safe —
+ * the next sync/checker pass reconciles any gap.
  */
 let txQueue: Promise<void> = Promise.resolve();
 
 export async function withTransaction(fn: (db: Database) => Promise<void>): Promise<void> {
-  // Queue this transaction behind any currently-running one.
-  // This serialises all transactions without blocking non-transactional reads.
+  // Queue this group behind any currently-running one. This serialises write
+  // groups without blocking non-transactional reads.
   const prev = txQueue;
   let resolve!: () => void;
   txQueue = new Promise<void>((r) => {
@@ -55,29 +75,16 @@ export async function withTransaction(fn: (db: Database) => Promise<void>): Prom
   });
 
   try {
-    await prev; // wait for previous transaction to finish
+    await prev; // wait for the previous group to finish
   } catch {
-    // previous transaction errored — that's fine, we can still proceed
+    // previous group errored — that's fine, we can still proceed
   }
 
-  const database = await getDb();
   try {
-    await database.execute("BEGIN TRANSACTION", []);
-    try {
-      await fn(database);
-      await database.execute("COMMIT", []);
-    } catch (err) {
-      // SQLite may auto-rollback on certain errors — guard against
-      // "cannot rollback - no transaction is active"
-      try {
-        await database.execute("ROLLBACK", []);
-      } catch {
-        // ROLLBACK failed (already rolled back) — safe to ignore
-      }
-      throw err;
-    }
+    const database = await getDb();
+    await fn(database);
   } finally {
-    resolve(); // always unblock the next queued transaction
+    resolve(); // always unblock the next queued group
   }
 }
 
